@@ -20,7 +20,7 @@ st.set_page_config(page_title="Approval Insights Dashboard", layout="wide")
 st.title("Approval Insights Dashboard")
 st.caption(
     "Interactive dashboard for approval behavior, fast approvals, block analysis, and hypothesis tests. "
-    "Includes filters, KPI trends, benchmark lines, heatmaps, suspicious ranking, and downloads."
+    "Includes filters, KPI trends, benchmark lines, risk scoring, heatmaps, and downloads."
 )
 
 # ----------------------------
@@ -49,9 +49,10 @@ def to_num(s):
 
 def add_duration_benchmarks(fig, axis="x", unit="sec"):
     """
-    Adds reference lines at 10, 5, 2 minutes.
-    If duration is on x-axis (histogram) -> axis="x" (vertical lines)
-    If duration is on y-axis (bar) -> axis="y" (horizontal lines)
+    Add benchmark reference lines for duration:
+      10 min, 5 min, 2 min.
+    For histograms where duration is on x-axis -> axis="x" (vertical lines).
+    For bar charts where duration is on y-axis -> axis="y" (horizontal lines).
     """
     if unit == "sec":
         points = [(600, "10 min"), (300, "5 min"), (120, "2 min")]
@@ -80,10 +81,9 @@ if not uploaded:
 sheets = load_excel(uploaded)
 st.success(f"Loaded sheets: {', '.join(sheets.keys())}")
 
-# Core sheets (based on your file)
+# Known tabs (from your screenshot)
 clean = sheets.get("clean_data")
 tech = sheets.get("technician_summary")
-fast_thr = sheets.get("fast_thresholds")
 block_kpis = sheets.get("block_kpis")
 one_sample = sheets.get("one_sample_ttests")
 payout = sheets.get("payout_two_sample")
@@ -92,15 +92,6 @@ within_dist = sheets.get("within_block_distributions")
 block_first_rest = sheets.get("block_first_vs_rest_summary")
 block_tests = sheets.get("block_first_vs_rest_tests")
 sus_blocks = sheets.get("suspicious_blocks")
-
-# New optional sheet name(s) user mentioned
-# Robust lookup for "Suspicious Ranking" sheet (ignores case and extra spaces)
-sus_rank = None
-normalized = {k.strip().lower(): k for k in sheets.keys()}
-for wanted in ["suspicious ranking", "suspicious_ranking"]:
-    if wanted in normalized:
-        sus_rank = sheets[normalized[wanted]]
-        break
 
 # Clean data required
 if clean is None:
@@ -117,6 +108,8 @@ dt_col = safe_col(clean, ["approval_dt", "Approval_DT", "approval_date"])
 weekday_col = safe_col(clean, ["weekday", "Weekday"])
 hour_col = safe_col(clean, ["hour", "Hour"])
 duration_sec_col = safe_col(clean, ["duration_sec", "duration_seconds", "Duration_Sec"])
+same_second_col = safe_col(clean, ["same_second_as_prev", "same_second"])
+same_minute_col = safe_col(clean, ["same_minute_as_prev", "same_minute"])
 
 if tech_col is None or dt_col is None:
     st.error("`clean_data` must contain `technician` and `approval_dt` columns.")
@@ -162,7 +155,6 @@ if hour_col:
 else:
     hour_range = None
 
-# Apply filters to clean_data
 mask = (
     df[tech_col].astype(str).isin([str(x) for x in selected_techs]) &
     (pd.to_datetime(df[dt_col]).dt.date >= start_date) &
@@ -190,8 +182,10 @@ pmask = (
     (pd.to_datetime(df[dt_col]).dt.date >= prev_start.date()) &
     (pd.to_datetime(df[dt_col]).dt.date <= prev_end.date())
 )
+
 if weekday_col and selected_weekdays is not None:
     pmask &= df[weekday_col].isin(selected_weekdays)
+
 if hour_col and hour_range is not None:
     hh = to_num(df[hour_col])
     pmask &= (hh >= hour_range[0]) & (hh <= hour_range[1])
@@ -207,152 +201,121 @@ def kpi_stats(dd):
         out["median_sec"] = float(np.nanmedian(dur))
         out["mean_sec"] = float(np.nanmean(dur))
         out["fast_lt_5_pct"] = float(np.nanmean(dur < 5) * 100)
+        out["fast_lt_2_pct"] = float(np.nanmean(dur < 2) * 100)
     else:
         out["median_sec"] = np.nan
         out["mean_sec"] = np.nan
         out["fast_lt_5_pct"] = np.nan
+        out["fast_lt_2_pct"] = np.nan
     return out
 
 cur = kpi_stats(fdf)
 prev = kpi_stats(pdf)
 
-def safe_delta(cur_v, prev_v):
-    # hide delta if previous is empty/invalid to avoid misleading big arrows
-    if prev_v in [0, None] or (isinstance(prev_v, float) and np.isnan(prev_v)):
-        return None
-    return cur_v - prev_v
-
 k1, k2, k3, k4, k5 = st.columns(5)
-k1.metric("Total approvals", f"{cur['approvals']:,}", delta=safe_delta(cur["approvals"], prev["approvals"]))
-k2.metric("Technicians", f"{cur['techs']:,}", delta=safe_delta(cur["techs"], prev["techs"]))
-k3.metric("Median duration (sec)", f"{cur['median_sec']:.2f}" if np.isfinite(cur["median_sec"]) else "NA",
-          delta=(cur["median_sec"] - prev["median_sec"]) if np.isfinite(cur["median_sec"]) and np.isfinite(prev["median_sec"]) else None)
-k4.metric("Mean duration (sec)", f"{cur['mean_sec']:.2f}" if np.isfinite(cur["mean_sec"]) else "NA",
-          delta=(cur["mean_sec"] - prev["mean_sec"]) if np.isfinite(cur["mean_sec"]) and np.isfinite(prev["mean_sec"]) else None)
-k5.metric("Fast < 5 sec (%)", f"{cur['fast_lt_5_pct']:.1f}%" if np.isfinite(cur["fast_lt_5_pct"]) else "NA",
-          delta=(cur["fast_lt_5_pct"] - prev["fast_lt_5_pct"]) if np.isfinite(cur["fast_lt_5_pct"]) and np.isfinite(prev["fast_lt_5_pct"]) else None)
+k1.metric("Total approvals", f"{cur['approvals']:,}", delta=f"{cur['approvals'] - prev['approvals']:+,}")
+k2.metric("Technicians", f"{cur['techs']:,}", delta=f"{cur['techs'] - prev['techs']:+,}")
+k3.metric(
+    "Median duration (sec)",
+    f"{cur['median_sec']:.2f}" if np.isfinite(cur["median_sec"]) else "NA",
+    delta=f"{(cur['median_sec'] - prev['median_sec']):+.2f}" if np.isfinite(prev["median_sec"]) and np.isfinite(cur["median_sec"]) else None
+)
+k4.metric(
+    "Mean duration (sec)",
+    f"{cur['mean_sec']:.2f}" if np.isfinite(cur["mean_sec"]) else "NA",
+    delta=f"{(cur['mean_sec'] - prev['mean_sec']):+.2f}" if np.isfinite(prev["mean_sec"]) and np.isfinite(cur["mean_sec"]) else None
+)
+k5.metric(
+    "Fast < 5 sec (%)",
+    f"{cur['fast_lt_5_pct']:.1f}%" if np.isfinite(cur["fast_lt_5_pct"]) else "NA",
+    delta=f"{(cur['fast_lt_5_pct'] - prev['fast_lt_5_pct']):+.1f}%" if np.isfinite(prev["fast_lt_5_pct"]) and np.isfinite(cur["fast_lt_5_pct"]) else None
+)
 
 st.divider()
 
-# ============================================================
-#  ✅ REPLACEMENT SECTION: Suspicious Ranking (instead of Risk Scoring)
-# ============================================================
-st.subheader("Suspicious Ranking")
+# ----------------------------
+# Risk Score (composite)
+# ----------------------------
+st.subheader("Technician Risk Scoring (Composite)")
 
-# show formula nicely + explanation
-with st.expander("How Suspicion Score is computed"):
-    st.markdown(
-        r"""
-**Suspicion Score** combines speed, clustering, and consistency signals:
-
-\[
-\textbf{Suspicion Score} =
-\text{Pct}_{<10s}
-\;+\;
-2 \times \text{Approvals in Block}
-\;+\;
-\Bigl(10 - \min(\text{Median Duration (sec)}, 10)\Bigr)
-\]
-
-**Interpretation (higher score = more suspicious):**
-- **Pct < 10s** increases the score when approvals are unusually fast
-- **2 × Approvals in Block** increases the score when approvals are heavily clustered
-- **(10 − min(median,10))** increases the score when typical duration is very short (capped at 10 sec)
-"""
+with st.expander("How the Risk Score is computed (simple + explainable)"):
+    st.write(
+        "- **Fast < 2 sec %** (weight 0.45)\n"
+        "- **Same-second rate** (weight 0.30)\n"
+        "- **Same-minute rate** (weight 0.15)\n"
+        "- **Suspicious blocks count** (weight 0.10)\n\n"
+        "Score is normalized to 0–100 within the filtered data."
     )
 
-st.caption("Below ranking is based on the block-level suspicious behavior (highest suspicion score first).")
+risk_df = fdf.groupby(tech_col).agg(approvals=(tech_col, "size")).reset_index()
 
-# Build / load Suspicious Ranking table
-# If user added a dedicated sheet, use it. Otherwise build from suspicious_blocks.
-ranking_source = None
-
-if sus_rank is not None:
-    ranking_source = sus_rank.copy()
+# fast <2%
+if duration_sec_col:
+    tmp = fdf.assign(_dur=to_num(fdf[duration_sec_col]))
+    r_fast2 = tmp.groupby(tech_col)["_dur"].apply(lambda x: float(np.nanmean(x < 2) * 100)).reset_index(name="fast_lt_2_pct")
 else:
-    if sus_blocks is not None:
-        ranking_source = sus_blocks.copy()
-    else:
-        ranking_source = None
+    r_fast2 = pd.DataFrame({tech_col: risk_df[tech_col], "fast_lt_2_pct": np.nan})
 
-if ranking_source is None:
-    st.info("No suspicious ranking data found. Add `suspicious_blocks` or `Suspicious Ranking` sheet to the Excel file.")
+# same-second / same-minute
+if same_second_col:
+    r_ss = fdf.groupby(tech_col)[same_second_col].mean().reset_index(name="same_second_rate")
+    r_ss["same_second_rate"] *= 100
 else:
-    # Make sure required columns exist (expected from suspicious_blocks)
-    # technician, block_id, approvals_in_block, median_duration_sec, pct_lt_10s, suspicion_score
-    tcol = safe_col(ranking_source, ["technician", "Technician"])
-    score_col = safe_col(ranking_source, ["suspicion_score", "Suspicion Score", "suspicionScore"])
-    pct10_col = safe_col(ranking_source, ["pct_lt_10s", "Pct < 10s", "pct_under_10s"])
-    appr_col = safe_col(ranking_source, ["approvals_in_block", "Approvals in Block"])
-    med_col = safe_col(ranking_source, ["median_duration_sec", "Median Duration (sec)", "median_sec"])
-    block_col = safe_col(ranking_source, ["block_id", "Block ID", "block"])
+    r_ss = pd.DataFrame({tech_col: risk_df[tech_col], "same_second_rate": np.nan})
 
-    if score_col is None and (pct10_col and appr_col and med_col):
-        # compute if not present
-        # suspicion_score = pct_lt_10s + 2*approvals_in_block + (10 - min(median_duration_sec,10))
-        med = to_num(ranking_source[med_col])
-        ranking_source["suspicion_score"] = (
-            to_num(ranking_source[pct10_col]) +
-            2 * to_num(ranking_source[appr_col]) +
-            (10 - np.minimum(med, 10))
-        )
-        score_col = "suspicion_score"
+if same_minute_col:
+    r_sm = fdf.groupby(tech_col)[same_minute_col].mean().reset_index(name="same_minute_rate")
+    r_sm["same_minute_rate"] *= 100
+else:
+    r_sm = pd.DataFrame({tech_col: risk_df[tech_col], "same_minute_rate": np.nan})
 
-    if score_col is None:
-        st.error("Cannot compute or find `suspicion_score`. Ensure columns exist: pct_lt_10s, approvals_in_block, median_duration_sec.")
+# suspicious blocks count
+if sus_blocks is not None:
+    s_tech_col = safe_col(sus_blocks, ["technician", "Technician"])
+    if s_tech_col:
+        sb = sus_blocks.groupby(s_tech_col).size().reset_index(name="suspicious_blocks").rename(columns={s_tech_col: tech_col})
     else:
-        # Sort by score desc
-        ranking_source[score_col] = to_num(ranking_source[score_col])
-        ranking_source = ranking_source.sort_values(score_col, ascending=False)
+        sb = pd.DataFrame({tech_col: risk_df[tech_col], "suspicious_blocks": 0})
+else:
+    sb = pd.DataFrame({tech_col: risk_df[tech_col], "suspicious_blocks": 0})
 
-        # Choose view: by block or by technician
-        view = st.radio("View ranking by:", ["Blocks", "Technicians"], horizontal=True)
+risk = risk_df.merge(r_fast2, on=tech_col, how="left") \
+              .merge(r_ss, on=tech_col, how="left") \
+              .merge(r_sm, on=tech_col, how="left") \
+              .merge(sb, on=tech_col, how="left")
 
-        if view == "Blocks":
-            n = min(20, len(ranking_source))
-            st.write(f"Showing top **{n}** blocks by Suspicion Score (filtered selection).")
+def norm01(series):
+    s = to_num(series)
+    if np.nanmax(s) == np.nanmin(s):
+        return pd.Series(np.zeros(len(s)))
+    return (s - np.nanmin(s)) / (np.nanmax(s) - np.nanmin(s))
 
-            # Table
-            show_cols = [c for c in [tcol, block_col, appr_col, med_col, pct10_col, score_col] if c and c in ranking_source.columns]
-            st.dataframe(ranking_source[show_cols].head(n), use_container_width=True)
+w_fast2, w_ss, w_sm, w_sb = 0.45, 0.30, 0.15, 0.10
+risk["risk_score_0_100"] = 100 * (
+    w_fast2 * norm01(risk["fast_lt_2_pct"]) +
+    w_ss * norm01(risk["same_second_rate"]) +
+    w_sm * norm01(risk["same_minute_rate"]) +
+    w_sb * norm01(risk["suspicious_blocks"])
+)
 
-            # Graph
-            # Use label = "technician - block_id" if both exist
-            plot_df = ranking_source.head(n).copy()
-            if tcol and block_col and tcol in plot_df.columns and block_col in plot_df.columns:
-                plot_df["label"] = plot_df[tcol].astype(str) + " | Block " + plot_df[block_col].astype(str)
-                xcol = "label"
-            else:
-                xcol = tcol if tcol else (block_col if block_col else None)
+risk = risk.sort_values("risk_score_0_100", ascending=False)
 
-            if xcol:
-                fig = px.bar(plot_df, x=xcol, y=score_col, title=f"Top {n} Blocks by Suspicion Score")
-                fig.update_layout(xaxis_title="", yaxis_title="Suspicion Score")
-                st.plotly_chart(fig, use_container_width=True)
+cA, cB = st.columns([1.2, 1])
+with cA:
+    st.dataframe(
+        risk[[tech_col, "approvals", "fast_lt_2_pct", "same_second_rate", "same_minute_rate", "suspicious_blocks", "risk_score_0_100"]].head(50),
+        use_container_width=True
+    )
+with cB:
+    fig = px.bar(risk.head(20), x=tech_col, y="risk_score_0_100", title="")
+    st.plotly_chart(fig, use_container_width=True)
 
-            download_button_df(ranking_source[show_cols], "Download Suspicious Ranking (Blocks) (CSV)", "suspicious_ranking_blocks.csv", "dl_susp_blocks")
-
-        else:
-            if tcol is None or tcol not in ranking_source.columns:
-                st.info("Cannot build technician ranking because technician column not found.")
-            else:
-                # Aggregate per technician
-                agg = ranking_source.groupby(tcol).agg(
-                    blocks=("suspicion_score", "size"),
-                    max_suspicion=(score_col, "max"),
-                    avg_suspicion=(score_col, "mean")
-                ).reset_index().sort_values("max_suspicion", ascending=False)
-
-                n = min(20, len(agg))
-                st.write(f"Showing top **{n}** technicians by **Max Suspicion Score** (filtered selection).")
-
-                st.dataframe(agg.head(n), use_container_width=True)
-
-                fig = px.bar(agg.head(n), x=tcol, y="max_suspicion", title=f"Top {n} Technicians by Max Suspicion Score")
-                fig.update_layout(xaxis_title="Technician", yaxis_title="Max Suspicion Score")
-                st.plotly_chart(fig, use_container_width=True)
-
-                download_button_df(agg, "Download Suspicious Ranking (Technicians) (CSV)", "suspicious_ranking_technicians.csv", "dl_susp_tech")
+download_button_df(
+    risk[[tech_col, "approvals", "fast_lt_2_pct", "same_second_rate", "same_minute_rate", "suspicious_blocks", "risk_score_0_100"]],
+    "Download Risk Scores (CSV)",
+    "risk_scores.csv",
+    "dl_risk"
+)
 
 st.divider()
 
@@ -383,19 +346,20 @@ with tab1:
         st.plotly_chart(fig, use_container_width=True)
 
     with right:
-        st.subheader("Duration distribution")
+        st.subheader("Duration distribution (with benchmark lines)")
         if duration_sec_col:
             tmp = fdf.copy()
             tmp["_dur"] = to_num(tmp[duration_sec_col])
             tmp = tmp.dropna(subset=["_dur"])
             fig = px.histogram(tmp, x="_dur", nbins=60)
+            # FIX: duration is on x-axis, so use vertical lines
             fig = add_duration_benchmarks(fig, axis="x", unit="sec")
             st.plotly_chart(fig, use_container_width=True)
         else:
             st.info("Duration column not found in clean_data.")
 
-    st.subheader("Approvals by technician")
-    top = fdf.groupby(tech_col).size().reset_index(name="approvals").sort_values("approvals", ascending=False)
+    st.subheader("Top technicians by approval volume")
+    top = fdf.groupby(tech_col).size().reset_index(name="approvals").sort_values("approvals", ascending=False).head(25)
     fig = px.bar(top, x=tech_col, y="approvals")
     st.plotly_chart(fig, use_container_width=True)
 
@@ -405,7 +369,7 @@ with tab1:
 # TAB 2: Technician Deep Dive
 # ----------------------------
 with tab2:
-    st.subheader("Technician summary")
+    st.subheader("Technician summary (from technician_summary sheet)")
     if tech is not None:
         st.dataframe(tech, use_container_width=True)
 
@@ -414,16 +378,11 @@ with tab2:
         med_col = safe_col(tech, ["median_duration_sec", "median_sec", "median_duration"])
         fast5_col = safe_col(tech, ["pct_fast_lt_5s", "fast_lt_5s_pct", "pct_fast_5s"])
 
-        # Dynamic N (no "top 25" wording)
-        n_tech = len(tech) if tech is not None else 0
-        top_n = min(25, n_tech) if n_tech else 0
-
         c1, c2 = st.columns(2)
-
         with c1:
             if tcol and approvals_col:
                 fig = px.bar(
-                    tech.sort_values(approvals_col, ascending=False).head(top_n),
+                    tech.sort_values(approvals_col, ascending=False).head(25),
                     x=tcol, y=approvals_col,
                     title="Approvals by technician"
                 )
@@ -432,25 +391,25 @@ with tab2:
         with c2:
             if tcol and med_col:
                 fig = px.bar(
-                    tech.sort_values(med_col, ascending=False).head(top_n),
+                    tech.sort_values(med_col, ascending=False).head(25),
                     x=tcol, y=med_col,
                     title="Median duration (sec) by technician"
                 )
+                # Here duration is on y-axis -> horizontal lines
                 fig = add_duration_benchmarks(fig, axis="y", unit="sec")
                 st.plotly_chart(fig, use_container_width=True)
 
         if tcol and fast5_col:
             fig = px.bar(
-                tech.sort_values(fast5_col, ascending=False).head(top_n),
+                tech.sort_values(fast5_col, ascending=False).head(25),
                 x=tcol, y=fast5_col,
                 title="Fast < 5 sec (%) by technician"
             )
             st.plotly_chart(fig, use_container_width=True)
-
     else:
         st.info("Sheet `technician_summary` not found.")
 
-    st.subheader("Filtered approvals (preview)")
+    st.subheader("Filtered raw approvals (preview)")
     st.dataframe(fdf.head(500), use_container_width=True)
 
 # ----------------------------
@@ -519,18 +478,11 @@ with tab4:
         rest_col  = safe_col(block_first_rest, ["rest_mean_sec", "rest_avg_sec", "rest_mean", "rest_duration_mean_sec", "rest_median_sec"])
 
         if btech and first_col and rest_col:
-            plot_df = block_first_rest[[btech, first_col, rest_col]].dropna()
-            top_n = min(25, len(plot_df))
-            plot_df = plot_df.head(top_n)
-
-            melted = plot_df.melt(
-                id_vars=[btech],
-                value_vars=[first_col, rest_col],
-                var_name="block_part",
-                value_name="duration_sec"
-            )
+            plot_df = block_first_rest[[btech, first_col, rest_col]].dropna().head(25)
+            melted = plot_df.melt(id_vars=[btech], value_vars=[first_col, rest_col],
+                                  var_name="block_part", value_name="duration_sec")
             fig = px.bar(melted, x=btech, y="duration_sec", color="block_part", barmode="group",
-                         title="First approval vs Rest of block (duration in seconds)")
+                         title="First approval vs Rest")
             fig = add_duration_benchmarks(fig, axis="y", unit="sec")
             st.plotly_chart(fig, use_container_width=True)
         else:
