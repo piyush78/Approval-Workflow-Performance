@@ -94,11 +94,13 @@ block_tests = sheets.get("block_first_vs_rest_tests")
 sus_blocks = sheets.get("suspicious_blocks")
 
 # New optional sheet name(s) user mentioned
-sus_rank = (
-    sheets.get("Suspicious Ranking")
-    or sheets.get("suspicious_ranking")
-    or sheets.get("suspicious_ranking ")
-)
+# Robust lookup for "Suspicious Ranking" sheet (ignores case and extra spaces)
+sus_rank = None
+normalized = {k.strip().lower(): k for k in sheets.keys()}
+for wanted in ["suspicious ranking", "suspicious_ranking"]:
+    if wanted in normalized:
+        sus_rank = sheets[normalized[wanted]]
+        break
 
 # Clean data required
 if clean is None:
